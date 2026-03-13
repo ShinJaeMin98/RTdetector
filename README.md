@@ -1,5 +1,5 @@
 # RTdetector
-This repository supplements our paper "RTdetector: Deep Transformer Networks for Time Series Anomaly Detection based on Reconstruction Trend" .
+This repository supplements our paper "RTdetector: Deep Transformer Networks for Time Series Anomaly Detection based on Reconstruction Trend" . [See here.](https://www.ijcai.org/proceedings/2025/0644.pdf)
 ## Installation
 This code needs Python-3.7 or higher.
 ```bash
