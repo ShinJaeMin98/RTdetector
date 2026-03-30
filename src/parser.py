@@ -23,3 +23,5 @@ parser.add_argument('--less',
 					action='store_true', 
 					help="train using less data")
 args = parser.parse_args()
+
+# print(f"args: {args}")

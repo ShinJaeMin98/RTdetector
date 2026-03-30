@@ -48,3 +48,5 @@ percentile_merlin = percentiles[args.dataset][0]
 cvp = percentiles[args.dataset][1]
 preds = []
 debug = 9
+
+# print(f"lr: {lr}")

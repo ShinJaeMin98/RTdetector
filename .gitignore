@@ -35,3 +35,12 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# Project docs (local notes; not versioned)
+docs/
+
+# Training / run outputs (keep repo source-only)
+checkpoints/
+plots/
+*.xlsx
+src/Untitled

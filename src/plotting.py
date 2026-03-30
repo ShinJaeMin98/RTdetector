@@ -17,7 +17,8 @@ def smooth(y, box_pts=1):
     y_smooth = np.convolve(y, box, mode='same')
     return y_smooth
 
-def plotter(name, y_true, y_pred, ascore, labels):
+# pot_thresholds, pot_preds 추가
+def plotter(name, y_true, y_pred, ascore, labels, pot_thresholds=None, pot_preds=None):
 	data = {
     'y_true': [y_true],
     'y_pred': [y_pred],
@@ -28,7 +29,7 @@ def plotter(name, y_true, y_pred, ascore, labels):
 	df.to_excel('output.xlsx', index=False)
 	if name in ['DAGMM', 'RTdetector']: y_true = torch.roll(y_true, 1, 0)
 	os.makedirs(os.path.join('plots', name), exist_ok=True)
-	pdf = PdfPages(f'plots/{name}/output.pdf')
+	pdf = PdfPages(f'plots/{name}/output_machine-1-1.pdf')
 	for dim in range(y_true.shape[1]):
 		y_t, y_p, l, a_s = y_true[:, dim], y_pred[:, dim], labels[:, dim], ascore[:, dim]
 		fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
@@ -42,6 +43,26 @@ def plotter(name, y_true, y_pred, ascore, labels):
 		ax3.fill_between(np.arange(l.shape[0]), l, color='blue', alpha=0.3)
 		if dim == 0: ax1.legend(ncol=2, bbox_to_anchor=(0.6, 1.02))
 		ax2.plot(smooth(a_s), linewidth=0.2, color='g')
+		
+		# 코드 추가
+		# POT threshold line (if provided)
+		if pot_thresholds is not None:
+			try:
+				th = float(pot_thresholds[dim])
+				ax2.axhline(th, color='r', linestyle='--', linewidth=0.3, alpha=0.6)
+				if dim == 0:
+					ax2.legend(['Anomaly Score', 'POT threshold'], loc='upper right', fontsize=6)
+			except Exception:
+				pass
+		# Highlight predicted anomaly regions (if provided)
+		if pot_preds is not None:
+			try:
+				pred_mask = np.array(pot_preds[:, dim]).astype(bool)
+				x = np.arange(a_s.shape[0])
+				ax2.fill_between(x, ax2.get_ylim()[0], ax2.get_ylim()[1], where=pred_mask, color='red', alpha=0.08, step='pre')
+			except Exception:
+				pass
+			
 		ax2.set_xlabel('Timestamp')
 		ax2.set_ylabel('Anomaly Score')
 		pdf.savefig(fig)
