@@ -216,6 +216,31 @@ class RTdetector(nn.Module):
         self.fcn = nn.Sequential(nn.Linear(2 * feats, feats), nn.Sigmoid())
         self.tau_learner   = Projector(enc_in=2*feats, seq_len=self.n_window, hidden_dims=[16], hidden_layers=1, output_dim=1)
         self.delta_learner = Projector(enc_in=2*feats, seq_len=self.n_window, hidden_dims=[16], hidden_layers=1, output_dim=self.n_window)
+        self.use_rt_attention_logits = True
+
+    def _rt_clear_encoder(self):
+        for layer in self.transformer_encoder.layers:
+            layer._rt_tau = None
+            layer._rt_delta = None
+
+    def _rt_set_encoder(self, tau, delta):
+        for layer in self.transformer_encoder.layers:
+            layer._rt_tau = tau
+            layer._rt_delta = delta
+
+    def _rt_apply_decoder(self, decoder):
+        for layer in decoder.layers:
+            layer._rt_tau = self._rt_tau
+            layer._rt_delta = self._rt_delta
+            layer._rt_delta_self = getattr(self, '_rt_delta_self', None)
+            layer._rt_delta_cross = getattr(self, '_rt_delta_cross', None)
+
+    def _rt_clear_decoder(self, decoder):
+        for layer in decoder.layers:
+            layer._rt_tau = None
+            layer._rt_delta = None
+            layer._rt_delta_self = None
+            layer._rt_delta_cross = None
 
     def encode(self, src,c,tgt):
         src = torch.cat((src, c), dim=2)
@@ -226,37 +251,90 @@ class RTdetector(nn.Module):
         self.std_enc = std_enc
         self.mean_enc = mean_enc
         src = src/std_enc
-        tau = self.tau_learner(src,std_enc).exp()
-        delta = self.delta_learner(src, mean_enc)
-        tau = 1.0 if tau is None else tau.unsqueeze(1)
-        delta = 0.0 if delta is None else delta.unsqueeze(1)
+        # After cat + permute, src is (B, W, 2F); mean/std are (B, 1, 2F) (dim 1 = time).
+        src_bw = src.contiguous()
+        std_enc_bp = std_enc
+        mean_enc_bp = mean_enc
+        tau = self.tau_learner(src_bw, std_enc_bp).exp()
+        delta = self.delta_learner(src_bw, mean_enc_bp)
+        Bsz, Wsz = src.shape[0], src.shape[1]
+        if tau is None:
+            tau = torch.ones(Bsz, 1, 1, device=src.device, dtype=src.dtype)
+        else:
+            tau = tau.unsqueeze(1)
+        if delta is None:
+            delta = torch.zeros(Bsz, 1, Wsz, device=src.device, dtype=src.dtype)
+        else:
+            delta = delta.unsqueeze(1)
         src = src.permute(1, 0, 2)
         src = self.pos_encoder(src)
+        if self.use_rt_attention_logits:
+            self._rt_tau = tau
+            self._rt_delta = delta
+            self._rt_delta_self = delta.mean(dim=2, keepdim=True)
+            self._rt_delta_cross = delta
+            self._rt_set_encoder(tau, delta)
+            memory = self.transformer_encoder(src)
+            self._rt_clear_encoder()
+            tgt = tgt.repeat(1, 1, 2)
+            return tgt, memory
         memory = self.transformer_encoder(src)
         memory = memory.permute(1, 0, 2)
-        delta = delta.permute(0, 2, 1)
-        memory = memory*tau + delta
+        delta_legacy = delta.permute(0, 2, 1)
+        memory = memory*tau + delta_legacy
         memory = memory.permute(1, 0, 2)
         tgt = tgt.repeat(1, 1, 2)
-        result = torch.mean(delta, axis=1, keepdims=True)
-        tgt = tgt.permute(1, 0, 2)
-        tgt = tgt*tau+result
-        tgt = tgt.permute(1, 0, 2)
+        result = torch.mean(delta_legacy, dim=1, keepdim=True).permute(1, 0, 2)
+        tau_b = tau.permute(1, 0, 2)
+        tgt = tgt * tau_b + result
         return tgt, memory
 
     def forward(self, src, tgt):
-        c = torch.zeros_like(src)
-        decoder_out = self.transformer_decoder1(*self.encode(src, c, tgt)).squeeze(0)
+        # Algorithm 1 requires three decoder outputs:
+        # - O1  : Decoder1 with c = 0
+        # - O2  : Decoder2 with c = 0
+        # - Ô2  : Decoder2 with c = ||O1 - W||^2  (focus-based)
+        c0 = torch.zeros_like(src)
+
+        # O1 (Decoder1, c=0)
+        em = self.encode(src, c0, tgt)
+        if self.use_rt_attention_logits:
+            self._rt_apply_decoder(self.transformer_decoder1)
+        decoder_out = self.transformer_decoder1(*em).squeeze(0)
+        if self.use_rt_attention_logits:
+            self._rt_clear_decoder(self.transformer_decoder1)
         std_enc = self.std_enc.squeeze(1)
         mean_enc = self.mean_enc.squeeze(1)
-        decoder_out = decoder_out*std_enc+mean_enc
+        decoder_out = decoder_out * std_enc + mean_enc
         decoder_out = decoder_out.unsqueeze(0)
-        x1 = self.fcn(decoder_out)
-        c = (x1 - src) ** 2
-        decoder_out = self.transformer_decoder2(*self.encode(src, c, tgt)).squeeze(0)
+        O1 = self.fcn(decoder_out)
+
+        # O2 (Decoder2, c=0)
+        em = self.encode(src, c0, tgt)
+        if self.use_rt_attention_logits:
+            self._rt_apply_decoder(self.transformer_decoder2)
+        decoder_out = self.transformer_decoder2(*em).squeeze(0)
+        if self.use_rt_attention_logits:
+            self._rt_clear_decoder(self.transformer_decoder2)
         std_enc = self.std_enc.squeeze(1)
         mean_enc = self.mean_enc.squeeze(1)
-        decoder_out = decoder_out*std_enc+mean_enc
+        decoder_out = decoder_out * std_enc + mean_enc
         decoder_out = decoder_out.unsqueeze(0)
-        x2 = self.fcn(decoder_out)
-        return x1, x2
+        O2 = self.fcn(decoder_out)
+
+        # Ô2 (Decoder2, c = (O1 - W)^2)
+        c_focus = (O1 - src) ** 2
+        em = self.encode(src, c_focus, tgt)
+        if self.use_rt_attention_logits:
+            self._rt_apply_decoder(self.transformer_decoder2)
+        decoder_out = self.transformer_decoder2(*em).squeeze(0)
+        if self.use_rt_attention_logits:
+            self._rt_clear_decoder(self.transformer_decoder2)
+        std_enc = self.std_enc.squeeze(1)
+        mean_enc = self.mean_enc.squeeze(1)
+        decoder_out = decoder_out * std_enc + mean_enc
+        decoder_out = decoder_out.unsqueeze(0)
+        Oh2 = self.fcn(decoder_out)
+
+        # Keep ordering: (x1, x2_hat, x2_base) so existing inference code using [0],[1] still works.
+        return O1, Oh2, O2

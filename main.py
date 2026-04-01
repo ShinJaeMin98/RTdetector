@@ -51,7 +51,7 @@ def save_model(model, optimizer, scheduler, epoch, accuracy_list):
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'accuracy_list': accuracy_list}, file_path)
-
+	
 def load_model(modelname, dims):
 	import src.models
 	model_class = getattr(src.models, modelname)
@@ -86,33 +86,103 @@ def backprop(epoch, model, data, dataO, optimizer, scheduler, training = True):
 	dataset = TensorDataset(data_x, data_x)
 	bs = model.batch if training else len(data)
 	dataloader = DataLoader(dataset, batch_size = bs, shuffle= None, num_workers= 2)
-	n = epoch + 1
+	# Paper hyperparameter (Sec 3.2): use a fixed η value.
+	eta = 0.5	# 동일 가중 (임시)
 	w_size = model.n_window
 	l1s, l2s = [], []
 	if training:
+		def _set_requires_grad(mod, requires_grad: bool):
+			if mod is None:
+				return
+			for p in mod.parameters():
+				p.requires_grad = requires_grad
+
 		for d, _ in dataloader:
 			local_bs = d.shape[0]
 			window = d.permute(1, 0, 2)
 			elem = window[-1, :, :].view(1, local_bs, feats)
+			decoder1 = getattr(model, "transformer_decoder1", None)
+			decoder2 = getattr(model, "transformer_decoder2", None)
+
+			# Step A (L1): freeze Decoder2, update (E, Decoder1) by minimizing L1
+			_set_requires_grad(decoder2, False)
+			_set_requires_grad(decoder1, True)
 			z = model(window, elem)
-			l1 = l(z, elem) if not isinstance(z, tuple) else (1 / n) * l(z[0], elem) + (1 - 1/n) * l(z[1], elem)
-			if isinstance(z, tuple): z = z[1]
-			l1s.append(torch.mean(l1).item())
-			loss = torch.mean(l1)
-			optimizer.zero_grad()
-			loss.backward(retain_graph=True)
-			optimizer.step()
+
+			if isinstance(z, tuple) and len(z) == 3:
+				O1, Oh2, O2 = z[0], z[1], z[2]
+				err_O1 = l(O1, elem)    # ||O1 - W||^2
+				err_Oh2 = l(Oh2, elem) # ||Ô2 - W||^2
+				err_O2 = l(O2, elem)    # ||O2 - W||^2
+
+				L1 = torch.mean(eta * err_O1 + (1 - eta) * err_Oh2)
+				optimizer.zero_grad()
+				L1.backward()
+				optimizer.step()
+				l1s.append(L1.detach().item())
+
+				# Step B (L2): freeze Decoder1, update (E, Decoder2) by minimizing L2
+				_set_requires_grad(decoder2, True)
+				_set_requires_grad(decoder1, False)
+				z2 = model(window, elem)
+
+				O1b, Oh2b, O2b = z2[0], z2[1], z2[2]
+				err_Oh2b = l(Oh2b, elem)
+				err_O2b = l(O2b, elem)
+				L2 = torch.mean(eta * err_O2b - (1 - eta) * err_Oh2b)
+
+				optimizer.zero_grad()
+				L2.backward()
+				optimizer.step()
+				l2s.append(L2.detach().item())
+
+				# Restore trainability
+				_set_requires_grad(decoder2, True)
+				_set_requires_grad(decoder1, True)
+
+			else:
+				# Fallback: keep the previous behavior if the model doesn't match the expected output format.
+				# (This path is primarily for other model variants.)
+				_set_requires_grad(decoder2, True)
+				_set_requires_grad(decoder1, True)
+				loss_elem = l(z, elem) if not isinstance(z, tuple) else (eta * l(z[0], elem) + (1 - eta) * l(z[1], elem))
+				l1s.append(torch.mean(loss_elem).item())
+				optimizer.zero_grad()
+				torch.mean(loss_elem).backward()
+				optimizer.step()
+
 		scheduler.step()
-		tqdm.write(f'Epoch {epoch},\tL1 = {np.mean(l1s)}')
+		# Report both losses for easier debugging.
+		if len(l2s) > 0:
+			tqdm.write(f'Epoch {epoch},\tL1 = {np.mean(l1s)},\tL2 = {np.mean(l2s)}')
+		else:
+			tqdm.write(f'Epoch {epoch},\tL1 = {np.mean(l1s)}')
 		return np.mean(l1s), optimizer.param_groups[0]['lr']
 	else:
+		# Paper-align: inference anomaly score should combine Phase1/Phase2 reconstruction errors.
+		# Keep original behavior by toggling the flag below.
+		use_paper_score = True
 		for d, _ in dataloader:
 			window = d.permute(1, 0, 2)
 			elem = window[-1, :, :].view(1, bs, feats)
-			z = model(window, elem)	
-			if isinstance(z, tuple): z = z[1]
-		loss = l(z, elem)[0]
-		return loss.detach().numpy(), z.detach().numpy()[0]
+			z = model(window, elem)
+
+			if isinstance(z, tuple):
+				x1, x2 = z[0], z[1]
+				# loss shape: (1, bs, feats) -> take [0] => (bs, feats)
+				if use_paper_score:
+					err1 = l(x1, elem)[0]
+					err2 = l(x2, elem)[0]
+					loss = 0.5 * err1 + 0.5 * err2
+				else:
+					loss = l(x2, elem)[0]
+				# Keep plotting/prediction output consistent with original code.
+				z_plot = x2
+			else:
+				z_plot = z
+				loss = l(z_plot, elem)[0]
+
+		return loss.detach().numpy(), z_plot.detach().numpy()[0]
 
 if __name__ == '__main__':
 	train_loader, test_loader, labels = load_dataset(args.dataset)
